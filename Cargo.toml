@@ -1,0 +1,12 @@
+[package]
+name = "box-crypt"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+portable-atomic = "1.6.0"
+# obfstr = { version = "*", git = "https://github.com/SesameOne-Software/obfstr.git" }
