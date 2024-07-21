@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(
+    const_slice_from_raw_parts_mut,
     const_refs_to_cell,
     const_type_id,
     const_mut_refs,
@@ -35,14 +36,11 @@ impl<T> Drop for EncBox<T> {
 
 #[inline(always)]
 const fn crypt<T>(key: &[u8; 16], obj: &mut T) {
-    let obj_size = mem::size_of::<T>();
+    let obj =
+        unsafe { core::slice::from_raw_parts_mut(obj as *mut _ as *mut u8, mem::size_of::<T>()) };
 
-    for i in 0..obj_size {
-        let cur_byte = unsafe { (obj as *mut T as *mut u8).add(i) };
-
-        unsafe {
-            *cur_byte ^= key[i % key.len()];
-        }
+    for i in 0..obj.len() {
+        obj[i] ^= key[i % key.len()];
     }
 }
 
