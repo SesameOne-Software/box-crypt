@@ -1,142 +1,146 @@
 #![no_std]
-#![feature(thin_box, unchecked_math)]
 
 extern crate alloc;
 
-use alloc::boxed::ThinBox;
-use core::{
-    arch::x86_64::{_mm_pause, _rdtsc},
-    mem,
-    ptr::copy_nonoverlapping,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::{arch::x86_64::_rdtsc, hint, mem};
 
-#[inline(always)]
-fn rand64() -> u64 {
-    unsafe {
-        static mut RAND_GEN_LOCK: AtomicBool = AtomicBool::new(false);
-        static mut RAND_NUM: u64 = 0;
+use alloc::boxed::Box;
+use obfstr::random;
 
-        while !RAND_GEN_LOCK
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            _mm_pause();
-        }
+const KEY_LEN: usize = 16;
 
-        let prev_rand_num = RAND_NUM;
-        let _ = RAND_NUM.unchecked_mul(_rdtsc());
-        RAND_NUM ^= prev_rand_num;
-        let result = RAND_NUM;
+pub struct EncBox<T> {
+    key: [u8; KEY_LEN],
+    reader_count: usize,
+    writer_count: usize,
+    data: Box<T>,
+}
 
-        RAND_GEN_LOCK.store(false, Ordering::SeqCst);
+unsafe impl<T> Send for EncBox<T> {}
+unsafe impl<T> Sync for EncBox<T> {}
 
-        result
+impl<T> Drop for EncBox<T> {
+    // decrypt data before dropping or we will be calling Drop on an invalid object
+    fn drop(&mut self) {
+        crypt(&self.key, &mut *self.data);
     }
 }
 
-#[repr(C, align(8))]
-pub struct Box<T> {
-    key: u64,
-    inner: ThinBox<T>,
-}
-
 #[inline(always)]
-pub fn xor_until_size<T>(x: &mut T, key: [u8; 8]) {
-    // encrypt new value
-    let mut size = mem::size_of_val(x);
+fn crypt<T>(key: &[u8; KEY_LEN], obj: &mut T) {
+    let obj_size = mem::size_of::<T>();
 
-    while size != 0 {
-        let size_mod = size % mem::size_of_val(&key);
+    for i in 0..obj_size {
+        let cur_byte = unsafe { (obj as *mut T as *mut u8).add(i) };
 
-        match size_mod {
-            0 => unsafe {
-                let x = x as *mut T as usize + size - mem::size_of::<u64>();
-                let x_val = (x as *mut u64).read_unaligned();
-                (x as *mut u64).write_unaligned(x_val ^ u64::from_ne_bytes(key));
-            },
-            1 => unsafe {
-                let x = x as *mut T as usize + size - mem::size_of::<u8>();
-                let x_val = (x as *mut u8).read_unaligned();
-                (x as *mut T as *mut u8).write_unaligned(x_val ^ key[0]);
-            },
-            2 => unsafe {
-                let x = x as *mut T as usize + size - mem::size_of::<u16>();
-                let x_val = (x as *mut T as *mut u16).read_unaligned();
-                (x as *mut T as *mut u16)
-                    .write_unaligned(x_val ^ u16::from_ne_bytes([key[0], key[1]]));
-            },
-            4 => unsafe {
-                let x = x as *mut T as usize + size - mem::size_of::<u32>();
-                let x_val = (x as *mut T as *mut u32).read_unaligned();
-                (x as *mut T as *mut u32)
-                    .write_unaligned(x_val ^ u32::from_ne_bytes([key[0], key[1], key[2], key[3]]));
-            },
-            // probably should panic
-            _ => break,
+        unsafe {
+            *cur_byte = *cur_byte ^ key[i % KEY_LEN];
         }
-
-        size -= size_mod;
     }
 }
 
-impl<T> Box<T> {
-    #[allow(unused_assignments)]
+impl<T> EncBox<T> {
     #[inline(always)]
-    pub fn new(mut value: T) -> Box<T> {
-        // generate new key
-        let key = rand64().to_ne_bytes();
+    pub fn new(mut obj: T) -> Self {
+        let key = unsafe { mem::transmute([_rdtsc() ^ random!(u64), _rdtsc() ^ random!(u64)]) };
 
-        // encrypt inner box contents
-        xor_until_size(&mut value, key);
+        crypt(&key, &mut obj);
 
-        // store
-        let result = Box {
-            key: u64::from_ne_bytes(key),
-            inner: {
-                let mut inner = ThinBox::new(value);
+        Self {
+            key,
+            reader_count: 0,
+            writer_count: 0,
+            data: Box::new(obj),
+        }
+    }
 
-                // encrypt inner box ptr
-                xor_until_size(&mut inner, key);
-
-                inner
-            },
+    pub fn get(&self) -> T {
+        let writer_count = unsafe {
+            (&self.writer_count as *const usize as *mut usize)
+                .as_mut()
+                .unwrap()
         };
 
-        // zero memory on stack
-        value = unsafe { mem::zeroed() };
+        let reader_count = unsafe {
+            (&self.reader_count as *const usize as *mut usize)
+                .as_mut()
+                .unwrap()
+        };
 
-        result
+        // dont read while writing
+        // but we can have multiple readers at the same time
+        while *writer_count != 0 {
+            hint::spin_loop();
+        }
+
+        *reader_count += 1;
+        let mut output = unsafe { (&*self.data as *const T).read() };
+        *reader_count -= 1;
+
+        crypt(&self.key, &mut output);
+
+        output
     }
 
-    #[inline(always)]
-    pub fn get(&self) -> T {
-        // decrypt ptr
-        let mut encrypted_ptr: usize = unsafe { mem::transmute_copy(&self.inner) };
+    pub fn set(&mut self, mut obj: T) -> T {
+        let reader_count = unsafe {
+            (&self.reader_count as *const usize as *mut usize)
+                .as_mut()
+                .unwrap()
+        };
 
-        xor_until_size(&mut encrypted_ptr, self.key.to_ne_bytes());
+        let writer_count = unsafe {
+            (&self.writer_count as *const usize as *mut usize)
+                .as_mut()
+                .unwrap()
+        };
 
-        // decrypt data
-        unsafe {
-            let mut copy_buffer: T = mem::zeroed();
-            copy_nonoverlapping(encrypted_ptr as *const T, &mut copy_buffer, 1);
-            xor_until_size(&mut copy_buffer, self.key.to_ne_bytes());
+        crypt(&self.key, &mut obj);
 
-            copy_buffer
+        // no readers and no writers (allow only 1 writer at a time, this one)
+        while *reader_count != 0 || *writer_count != 0 {
+            hint::spin_loop();
         }
+
+        *writer_count += 1;
+        mem::swap(&mut *self.data, &mut obj);
+        *writer_count -= 1;
+
+        crypt(&self.key, &mut obj);
+
+        obj
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Make sure getting current value and setting new value (storing old) works
+    #[test]
+    fn basic() {
+        let mut data = EncBox::new([0i32; 4]);
+
+        assert!(data.set([1, 2, 3, 4]) == [0, 0, 0, 0]);
+        assert!(data.get() == [1, 2, 3, 4]);
     }
 
-    #[inline(always)]
-    pub fn set(&self, mut value: T) {
-        // decrypt ptr
-        let mut encrypted_ptr: usize = unsafe { mem::transmute_copy(&self.inner) };
+    // If we forcefully read the data, it shoudn't look correct,
+    // make sure its only readable when from EncBox::get
+    #[test]
+    fn encrypted_in_memory() {
+        let data = EncBox::new([1, 2, 3, 4]);
 
-        xor_until_size(&mut encrypted_ptr, self.key.to_ne_bytes());
+        assert!(*data.data != [1, 2, 3, 4]);
+        assert!(data.get() == [1, 2, 3, 4]);
+        assert!(*data.data != [1, 2, 3, 4]);
+    }
 
-        // encrypt data
-        unsafe {
-            xor_until_size(&mut value, self.key.to_ne_bytes());
-            copy_nonoverlapping(&value, encrypted_ptr as *mut T, 1);
-        }
+    // Make sure encryption key is never the same
+    #[test]
+    fn keytest() {
+        let data = [EncBox::new([1, 2, 3, 4]), EncBox::new([4, 3, 2, 1])];
+
+        assert!(data[0].key != data[1].key);
     }
 }

@@ -8,5 +8,6 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+obfstr = { version = "*", git = "https://github.com/SesameOne-Software/obfstr.git" }
 portable-atomic = "1.6.0"
 # obfstr = { version = "*", git = "https://github.com/SesameOne-Software/obfstr.git" }
