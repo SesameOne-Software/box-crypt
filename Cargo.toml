@@ -10,4 +10,5 @@ edition = "2021"
 [dependencies]
 obfstr = { version = "*", git = "https://github.com/SesameOne-Software/obfstr.git" }
 portable-atomic = "1.6.0"
+const-fnv1a-hash = "1.1.0"
 # obfstr = { version = "*", git = "https://github.com/SesameOne-Software/obfstr.git" }
