@@ -6,37 +6,42 @@
     const_mut_refs,
     const_trait_impl,
     const_for,
-    const_type_name,
-    generic_const_exprs
+    const_type_name
 )]
 #![allow(mutable_transmutes)]
 
 extern crate alloc;
 
-use core::{
-    any::type_name,
-    hint::{self, black_box},
-    mem::{self, transmute_copy},
-};
+use core::{any::type_name, mem};
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
+use spin::RwLock;
 
 #[derive(Debug)]
-pub struct EncBox<T: Copy> {
-    reader_count: usize,
-    writer_count: usize,
-    data: Option<Box<T>>,
+#[repr(transparent)]
+pub struct EncBox<T: Clone> {
+    data: Option<Arc<RwLock<T>>>,
+}
+
+impl<T: Clone> Clone for EncBox<T> {
+    fn clone(&self) -> Self {
+        if let Some(x) = &self.data {
+            Self {
+                data: Some(Arc::clone(x)),
+            }
+        } else {
+            Self { data: None }
+        }
+    }
 }
 
 unsafe impl<T: Copy> Send for EncBox<T> {}
-unsafe impl<T: Copy> Sync for EncBox<T> {}
+unsafe impl<T: Clone> Sync for EncBox<T> {}
 
-impl<T: Copy> Drop for EncBox<T> {
+impl<T: Clone> Drop for EncBox<T> {
     // decrypt data before dropping or we will be calling Drop on an invalid object
     fn drop(&mut self) {
-        if let Some(data) = &mut self.data {
-            crypt(&Self::key(), data.as_mut());
-        }
+        crypt(&Self::key(), &mut *self.data.as_ref().unwrap().write());
     }
 }
 
@@ -52,7 +57,7 @@ const fn crypt<T>(key: &[u8; 16], obj: &mut T) {
     }
 }
 
-impl<T: Copy> EncBox<T> {
+impl<T: Clone> EncBox<T> {
     #[inline(always)]
     const fn key() -> [u8; 16] {
         const_fnv1a_hash::fnv1a_hash_str_128(type_name::<T>()).to_ne_bytes()
@@ -63,11 +68,7 @@ impl<T: Copy> EncBox<T> {
     }
 
     pub const fn empty() -> Self {
-        Self {
-            reader_count: 0,
-            writer_count: 0,
-            data: None,
-        }
+        Self { data: None }
     }
 
     #[inline(always)]
@@ -75,34 +76,12 @@ impl<T: Copy> EncBox<T> {
         crypt(&Self::key(), &mut obj);
 
         Self {
-            reader_count: 0,
-            writer_count: 0,
-            data: Some(Box::new(obj)),
+            data: Some(Arc::new(RwLock::new(obj))),
         }
     }
 
     pub fn get(&self) -> T {
-        let writer_count = unsafe {
-            (&self.writer_count as *const usize as *mut usize)
-                .as_mut()
-                .unwrap()
-        };
-
-        let reader_count = unsafe {
-            (&self.reader_count as *const usize as *mut usize)
-                .as_mut()
-                .unwrap()
-        };
-
-        // dont read while writing
-        // but we can have multiple readers at the same time
-        black_box(while *writer_count != 0 {
-            hint::spin_loop();
-        });
-
-        *reader_count += 1;
-        let mut output = **self.data.as_ref().unwrap();
-        *reader_count -= 1;
+        let mut output = self.data.as_ref().unwrap().read().clone();
 
         crypt(&Self::key(), &mut output);
 
@@ -110,45 +89,22 @@ impl<T: Copy> EncBox<T> {
     }
 
     pub fn set(&self, mut obj: T) -> Option<T> {
-        let reader_count = unsafe {
-            (&self.reader_count as *const usize as *mut usize)
-                .as_mut()
-                .unwrap()
-        };
-
-        let writer_count = unsafe {
-            (&self.writer_count as *const usize as *mut usize)
-                .as_mut()
-                .unwrap()
-        };
-
         crypt(&Self::key(), &mut obj);
-
-        // no readers and no writers (allow only 1 writer at a time, this one)
-        black_box(while *reader_count != 0 || *writer_count != 0 {
-            hint::spin_loop();
-        });
 
         let has_value = self.data.is_some();
 
-        *writer_count += 1;
         if has_value {
-            mem::swap(
-                unsafe { core::mem::transmute::<&T, &mut T>(self.data.as_ref().unwrap()) },
-                &mut obj,
-            );
+            let mut x = self.data.as_ref().unwrap().write();
+            mem::swap(&mut *x, &mut obj);
+            crypt(&Self::key(), &mut obj);
+
+            Some(obj)
         } else {
             unsafe {
-                (*(self as *const Self as *mut Self)).data = Some(Box::new(obj));
+                (*(self as *const Self as *mut Self)).data = Some(Arc::new(RwLock::new(obj)));
             }
-        }
-        *writer_count -= 1;
 
-        if !has_value {
             None
-        } else {
-            crypt(&Self::key(), &mut obj);
-            Some(obj)
         }
     }
 }
@@ -172,9 +128,9 @@ mod tests {
     fn encrypted_in_memory() {
         let data = EncBox::new([1, 2, 3, 4]);
 
-        assert!(**data.data.as_ref().unwrap() != [1, 2, 3, 4]);
+        assert!(*data.data.as_ref().unwrap().read() != [1, 2, 3, 4]);
         assert!(data.get() == [1, 2, 3, 4]);
-        assert!(**data.data.as_ref().unwrap() != [1, 2, 3, 4]);
+        assert!(*data.data.as_ref().unwrap().read() != [1, 2, 3, 4]);
     }
 
     // Make sure encryption key is never the same
