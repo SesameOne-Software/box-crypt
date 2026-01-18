@@ -54,12 +54,11 @@ impl<T: Clone> Drop for EncVec<T> {
     // decrypt data before dropping or we will be calling Drop on an invalid object
     #[inline(always)]
     fn drop(&mut self) {
-        crypt_bytes(&Self::key(), unsafe {
-            core::slice::from_raw_parts_mut(
-                self.data.as_mut_ptr() as *mut u8,
-                size_of_val(&self.data[..]),
-            )
-        });
+        for obj in &mut self.data {
+            crypt_bytes(&Self::key(), unsafe {
+                core::slice::from_raw_parts_mut(obj as *mut _ as *mut u8, size_of_val(obj))
+            });
+        }
     }
 }
 
@@ -86,6 +85,16 @@ const fn crypt_bytes(key: &[u8; 16], obj: &mut [u8]) {
     }
 }
 
+#[inline(always)]
+const fn crypt_bytes_into(key: &[u8; 16], obj: &mut [u8], src: &[u8]) {
+    let mut i = 0;
+
+    while i < obj.len() {
+        obj[i] = src[i] ^ key[i % key.len()];
+        i += 1;
+    }
+}
+
 impl<T: Clone> EncVec<T> {
     #[inline(always)]
     const fn key() -> [u8; 16] {
@@ -102,9 +111,11 @@ impl<T: Clone> EncVec<T> {
 
     #[inline(always)]
     pub fn new(mut obj: Vec<T>) -> Self {
-        crypt_bytes(&Self::key(), unsafe {
-            core::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, size_of_val(&obj[..]))
-        });
+        for obj in &mut obj {
+            crypt_bytes(&Self::key(), unsafe {
+                core::slice::from_raw_parts_mut(obj as *mut _ as *mut u8, size_of_val(obj))
+            });
+        }
 
         Self { data: obj }
     }
@@ -113,14 +124,56 @@ impl<T: Clone> EncVec<T> {
     pub fn as_vec(&self) -> Vec<T> {
         let mut output = self.data.clone();
 
-        crypt_bytes(&Self::key(), unsafe {
-            core::slice::from_raw_parts_mut(
-                output.as_mut_ptr() as *mut u8,
-                size_of_val(&output[..]),
-            )
-        });
+        for obj in &mut output {
+            crypt_bytes(&Self::key(), unsafe {
+                core::slice::from_raw_parts_mut(obj as *mut _ as *mut u8, size_of_val(obj))
+            });
+        }
 
         output
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, mut val: T) {
+        crypt_bytes(&Self::key(), unsafe {
+            core::slice::from_raw_parts_mut(&raw mut val as *mut _ as *mut u8, size_of_val(&val))
+        });
+
+        self.data.push(val);
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) -> Option<T> {
+        self.data.pop().map(|mut x| {
+            crypt_bytes(&Self::key(), unsafe {
+                core::slice::from_raw_parts_mut(&raw mut x as *mut _ as *mut u8, size_of_val(&x))
+            });
+            x
+        })
+    }
+
+    #[inline(always)]
+    pub fn get(&self, index: usize) -> Option<T> {
+        self.data.get(index).map(|x| {
+            let mut x1: T = unsafe { core::mem::zeroed() };
+
+            crypt_bytes_into(
+                &Self::key(),
+                unsafe {
+                    core::slice::from_raw_parts_mut(
+                        &raw mut x1 as *mut _ as *mut u8,
+                        size_of_val(&x1),
+                    )
+                },
+                unsafe {
+                    core::slice::from_raw_parts(
+                        x as *const _ as *const u8,
+                        size_of_val(&x),
+                    )
+                },
+            );
+            x1
+        })
     }
 }
 
@@ -130,10 +183,12 @@ impl<T: Clone> EncBox<T> {
         const_fnv1a_hash::fnv1a_hash_str_128(type_name::<T>()).to_ne_bytes()
     }
 
+    #[inline(always)]
     pub fn current_key(&self) -> [u8; 16] {
         Self::key()
     }
 
+    #[inline(always)]
     pub const fn empty() -> Self {
         Self { data: None }
     }
@@ -147,6 +202,7 @@ impl<T: Clone> EncBox<T> {
         }
     }
 
+    #[inline(always)]
     pub fn get(&self) -> T {
         let mut output = self.data.as_ref().unwrap().read().clone();
 
@@ -155,6 +211,7 @@ impl<T: Clone> EncBox<T> {
         output
     }
 
+    #[inline(always)]
     pub fn set(&self, mut obj: T) -> Option<T> {
         crypt(&Self::key(), &mut obj);
 
